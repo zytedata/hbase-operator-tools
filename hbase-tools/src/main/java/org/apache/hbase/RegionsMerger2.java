@@ -42,9 +42,9 @@ import java.util.ArrayList;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Future;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.Random;
 
 import static org.apache.hadoop.hbase.HConstants.*;
 import static org.apache.hadoop.hbase.TableName.META_TABLE_NAME;
@@ -60,13 +60,21 @@ public class RegionsMerger2 extends Configured implements org.apache.hadoop.util
   private static final Logger LOG = LoggerFactory.getLogger(RegionsMerger2.class.getName());
   public static final String RESULTING_REGION_UPPER_MARK = "hbase.tools.merge.upper.mark";
   public static final String SLEEP = "hbase.tools.merge.sleep";
+  public static final String MAX_SLEEP_ROUNDS = "hbase.tools.merge.sleep.rounds";
   public static final String MAX_ROUNDS_IDLE = "hbase.tools.max.iterations.blocked";
+  public static final String MAX_MERGES_PER_ROUND = "hbase.tools.max.merges.perround";
+  public static final String MIN_REGION_AGE = "hbase.tools.min.region.age";
 
   private final Configuration conf;
   private final FileSystem fs;
   private final double resultSizeThreshold;
   private final int sleepBetweenCycles;
-  private final long maxRoundsStuck;
+  private final int maxSleepRoundsBetweenCycles;
+  private final int maxRoundsStuck;
+  private final int maxMergesPerRound;
+  private final int minRegionAgeDays;
+
+  private ExecutorService executor;
 
   public RegionsMerger2(Configuration conf) throws IOException {
     this.conf = conf;
@@ -74,8 +82,12 @@ public class RegionsMerger2 extends Configured implements org.apache.hadoop.util
     fs = basePath.getFileSystem(conf);
     resultSizeThreshold = this.conf.getDouble(RESULTING_REGION_UPPER_MARK, 0.7)
       * this.conf.getLong(HConstants.HREGION_MAX_FILESIZE, HConstants.DEFAULT_MAX_FILE_SIZE);
-    sleepBetweenCycles = this.conf.getInt(SLEEP, 30000);
+    sleepBetweenCycles = this.conf.getInt(SLEEP, 15000);
+    this.maxSleepRoundsBetweenCycles = this.conf.getInt(MAX_SLEEP_ROUNDS, 1);
     this.maxRoundsStuck = this.conf.getInt(MAX_ROUNDS_IDLE, 15);
+    this.maxMergesPerRound = this.conf.getInt(MAX_MERGES_PER_ROUND, 30);
+    this.minRegionAgeDays = this.conf.getInt(MIN_REGION_AGE, 7);
+    this.executor = Executors.newFixedThreadPool(this.maxMergesPerRound);
   }
 
   private Path getTablePath(TableName table) {
@@ -165,86 +177,193 @@ public class RegionsMerger2 extends Configured implements org.apache.hadoop.util
     return result;
   }
 
+  private Future<Void> requestMergeRegions(Admin admin, RegionInfo current,
+                                                   RegionInfo previous,
+                                                   Map<Future<Void>, Pair<RegionInfo, RegionInfo>> regionsMerging) {
+    return executor.submit(() -> {
+      Future<Void> f = admin.mergeRegionsAsync(current.getEncodedNameAsBytes(),
+        previous.getEncodedNameAsBytes(), false);
+
+      Pair<RegionInfo, RegionInfo> regionPair = new Pair<>(previous, current);
+      regionsMerging.put(f, regionPair);
+      return null;
+    });
+  }
+
   public void mergeRegions(String tblName, int maxNumberOfMerges) throws Exception {
-    LOG.info("Table name          : {}", tblName);
-    LOG.info("Max number of merges: {}", maxNumberOfMerges);
+    LOG.info("Table name             : {}", tblName);
+    LOG.info("Max number of merges   : {}", maxNumberOfMerges);
+    LOG.info("Result size threshold  : {} GB", resultSizeThreshold / GIGABYTE);
+    LOG.info("Sleep between cycles   : {}", sleepBetweenCycles);
+    LOG.info("Max rounds stuck       : {}", maxRoundsStuck);
+    LOG.info("Max merges per round   : {}", maxMergesPerRound);
+    LOG.info("Min region age in days : {}", minRegionAgeDays);
+
+    Random rand = new Random();
+    long minRegionAgeMilliseconds = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(minRegionAgeDays);
 
     TableName table = TableName.valueOf(tblName);
     Path tableDir = getTablePath(table);
     try (Connection conn = ConnectionFactory.createConnection(conf)) {
       Admin admin = conn.getAdmin();
       LongAdder counter = new LongAdder();
-      LongAdder lastTimeProgessed = new LongAdder();
+      //LongAdder lastTimeProgressed = new LongAdder();
       LongAdder merges = new LongAdder();
+      LongAdder mergesThisRound = new LongAdder();
+      LongAdder waitingRounds = new LongAdder();
+      LongAdder failureCount = new LongAdder();
+      LongAdder successCount = new LongAdder();
+      int startIndex, currentRegionIndex;
+      RegionInfo current;
+
       // need to get all regions for the table, regardless of region state
       List<RegionInfo> regions = admin.getRegions(table);
-      Map<Future, Pair<RegionInfo, RegionInfo>> regionsMerging = new ConcurrentHashMap<>();
-      long roundsNoProgress = 0;
+      List<Future<Void>> regionsMergingRequests = new ArrayList<>(20);
+      Map<Future<Void>, Pair<RegionInfo, RegionInfo>> regionsMerging = new ConcurrentHashMap<>();
+      //long roundsNoProgress = 0;
       while (merges.longValue() < maxNumberOfMerges) {
         LOG.info("Iteration: {}", counter);
         RegionInfo previous = null;
-        int regionSize = regions.size();
-        LOG.info("Current number of regions: {}", regionSize);
-        LOG.info("Attempting to merge regions to reach the target of {} merges", maxNumberOfMerges);
+        boolean currentHasMergeRef = true;
+        boolean previousHasMergeRef = true;
         // to request merge, regions must be OPEN, though
         regions = getOpenRegions(conn, table);
-        for (RegionInfo current : regions) {
-          if (!current.isSplit()) {
-            if (
-              previous != null && canMerge(tableDir, previous, current, regionsMerging.values())
-            ) {
+        LOG.info("Current number of open regions: {}", regions.size());
+        LOG.info("Attempting to merge regions to reach the remaining target of {} merges",
+            maxNumberOfMerges - merges.longValue());
+        startIndex = rand.nextInt(regions.size());
+        LOG.info("Starting from region index {}", startIndex);
+        for (int i = 0; i < regions.size(); i++) {
+          currentRegionIndex = (startIndex + i) % regions.size();
+          current = regions.get(currentRegionIndex);
+
+          /*
+           * RegionInfo.getRegionId() returns the region's creation timestamp
+           * in milliseconds (set at region creation time).
+           * This is the standard way to determine region "age" in HBase.
+           */
+          long regionId = current.getRegionId();
+          LOG.info("Evaluating region {}", regionId);
+
+          if (!current.isSplit() && regionId < minRegionAgeMilliseconds) {
+            boolean merging;
+            if (previous != null) {
+              merging = canMerge(tableDir, previous, current, regionsMerging.values());
+            } else {
+              merging = false;
+            }
+
+            if (merging) {
               // Before submitting a merge request, we need to check if any of the region candidates
               // still have merge references from previous cycle
-              boolean hasMergeRef =
-                hasPreviousMergeRef(conn, previous) || hasPreviousMergeRef(conn, current);
+              currentHasMergeRef = hasPreviousMergeRef(conn, current);
+              boolean hasMergeRef = previousHasMergeRef || currentHasMergeRef;
               if (!hasMergeRef) {
-                Future f = admin.mergeRegionsAsync(current.getEncodedNameAsBytes(),
-                  previous.getEncodedNameAsBytes(), true);
-                Pair<RegionInfo, RegionInfo> regionPair = new Pair<>(previous, current);
-                regionsMerging.put(f, regionPair);
-
+                LOG.info("Requesting merge...");
+                regionsMergingRequests.add(requestMergeRegions(admin, current, previous, regionsMerging));
                 merges.increment();
-                if (merges.longValue() >= maxNumberOfMerges) {
-                  LOG.info("The target of region merges was reached: Stopping merging.");
+                mergesThisRound.increment();
+
+                LOG.info("({}|{}) Requested the merging of regions {} and {} together.",
+                    mergesThisRound.intValue(),
+                    merges.intValue(),
+                    current.getEncodedName(),
+                    previous.getEncodedName());
+
+                if (mergesThisRound.longValue() >= maxMergesPerRound) {
+                  LOG.info("The target of region merges this round was reached: Stopping merging.");
+                  break;
+                }
+                if (merges.intValue() >= maxNumberOfMerges) {
+                  LOG.info("The target of region total merges was reached: Stopping merging.");
                   break;
                 }
               } else {
                 LOG.info("Skipping merge of candidates {} and {} because of existing merge "
-                  + "qualifiers.", previous.getEncodedName(), current.getEncodedName());
+                    + "qualifiers.", previous.getEncodedName(), current.getEncodedName());
               }
               previous = null;
+              previousHasMergeRef = true;
             } else {
               previous = current;
+              previousHasMergeRef = currentHasMergeRef;
             }
           } else {
             LOG.debug("Skipping split region: {}", current.getEncodedName());
           }
         }
+
+        LOG.info("Waiting for all the merging requests to be processed...");
+        for (Future<Void> f : regionsMergingRequests) {
+          f.get();
+        }
+        LOG.info("All requests where submitted.");
+
         counter.increment();
-        LOG.info("Sleeping for {} seconds before next iteration...", (sleepBetweenCycles / 1000));
-        Thread.sleep(sleepBetweenCycles);
+        waitingRounds.reset();
+
         regionsMerging.forEach((f, currentPair) -> {
-          if (f.isDone()) {
-            LOG.info("Merged regions {} and {} together.", currentPair.getFirst().getEncodedName(),
-              currentPair.getSecond().getEncodedName());
-            regionsMerging.remove(f);
-            lastTimeProgessed.reset();
-            lastTimeProgessed.add(counter.longValue());
-          } else {
-            LOG.warn("Merge of regions {} and {} isn't completed yet.", currentPair.getFirst(),
-              currentPair.getSecond());
+          LOG.info("Waiting for {} and {} merging.", currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName());
+          try {
+            f.get();
+            successCount.increment();
+          } catch (InterruptedException | ExecutionException e) {
+            LOG.error("Merging regions failed:", e);
+            failureCount.increment();
           }
         });
-        roundsNoProgress = counter.longValue() - lastTimeProgessed.longValue();
+
+        LOG.info("All requests completed: Success={} Failures={}",
+            successCount.intValue(), failureCount.intValue());
+
+        mergesThisRound.reset();
+        regionsMerging.clear();
+
+        if (merges.longValue() < maxNumberOfMerges) {
+          LOG.info("Sleeping for {} seconds before starting the next iteration...",
+              (sleepBetweenCycles / 1000));
+          Thread.sleep(sleepBetweenCycles);
+        }
+
+        /*while (!regionsMerging.isEmpty() && waitingRounds.intValue() < maxSleepRoundsBetweenCycles) {
+          LOG.info("Sleeping for {} seconds before starting the next iteration...",
+              (sleepBetweenCycles / 1000));
+          Thread.sleep(sleepBetweenCycles);
+          regionsMerging.forEach((f, currentPair) -> {
+            if (f.isDone()) {
+              LOG.info("Merged regions {} and {} together.", currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName());
+              regionsMerging.remove(f);
+              //lastTimeProgressed.reset();
+              //lastTimeProgressed.add(counter.longValue());
+            } else if (f.isCancelled()) {
+              //LOG.info("Cancelling merge regions {} and {} together.", currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName());
+              regionsMerging.remove(f);
+            } //else {
+              //LOG.warn("Merge of regions {} and {} isn't completed yet.", currentPair.getFirst(), currentPair.getSecond());
+            //}
+          });
+          waitingRounds.increment();
+        }*/
+        /*
+        if (regionsMerging.isEmpty()) {
+          LOG.info("All regions from the previous iteration were merged (total merged: {}).",
+              mergesThisRound.intValue());
+        } else {
+          LOG.warn("Some regions from the previous iteration are still pending (total merged: {}, total pending: {})...",
+              mergesThisRound.intValue(), regionsMerging.size());
+        }*/
+
+        /*roundsNoProgress = counter.longValue() - lastTimeProgressed.longValue();
         if (roundsNoProgress == this.maxRoundsStuck) {
           LOG.warn("Reached {} iterations without progressing with new merges. Aborting...",
             roundsNoProgress);
           break;
-        }
-
-        // again, get all regions, regardless of the state,
-        // in order to avoid breaking the loop prematurely
-        regions = admin.getRegions(table);
+        }*/
+        /*
+        LOG.info("Major compacting the hbase:meta table before the next round");
+        admin.majorCompact(TableName.META_TABLE_NAME);
+        Thread.sleep(sleepBetweenCycles);
+        */
       }
     }
   }
