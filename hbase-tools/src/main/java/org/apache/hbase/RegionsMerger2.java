@@ -297,7 +297,7 @@ public class RegionsMerger2 extends Configured implements org.apache.hadoop.util
         for (Future<Void> f : regionsMergingRequests) {
           f.get();
         }
-        LOG.info("All requests where submitted.");
+        LOG.info("All requests were submitted.");
 
         counter.increment();
         waitingRounds.reset();
@@ -380,6 +380,8 @@ public class RegionsMerger2 extends Configured implements org.apache.hadoop.util
     } catch (Exception e) {
       LOG.error("Merging regions failed:", e);
       return 2;
+    } finally {
+      executor.shutdown();
     }
     return 0;
   }
