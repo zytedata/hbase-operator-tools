@@ -28,8 +28,14 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeoutException;
+import java.util.Random;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.conf.Configured;
 import org.apache.hadoop.fs.FileStatus;
@@ -64,26 +70,40 @@ import org.slf4j.LoggerFactory;
  * size.
  */
 public class RegionsMerger extends Configured implements org.apache.hadoop.util.Tool {
+  private static final long GIGABYTE = 1024*1024*1024;
 
   private static final Logger LOG = LoggerFactory.getLogger(RegionsMerger.class.getName());
   public static final String RESULTING_REGION_UPPER_MARK = "hbase.tools.merge.upper.mark";
   public static final String SLEEP = "hbase.tools.merge.sleep";
   public static final String MAX_ROUNDS_IDLE = "hbase.tools.max.iterations.blocked";
+  public static final String MAX_MERGES_PER_ROUND = "hbase.tools.merge.max.merges_per_round";
+  public static final String MIN_REGION_AGE_DAYS = "hbase.tools.merge.min.age_days";
+  public static final String MERGE_TIMEOUT_SECS = "hbase.tools.merge.timeout_secs";
 
   private final Configuration conf;
   private final FileSystem fs;
   private final double resultSizeThreshold;
   private final int sleepBetweenCycles;
   private final long maxRoundsStuck;
+  private final int maxMergesPerRound;
+  private final int minRegionAgeDays;
+  private final int mergeTimeoutSecs;
+
+  private final ExecutorService executor;
 
   public RegionsMerger(Configuration conf) throws IOException {
     this.conf = conf;
     Path basePath = new Path(conf.get(HConstants.HBASE_DIR));
     fs = basePath.getFileSystem(conf);
     resultSizeThreshold = this.conf.getDouble(RESULTING_REGION_UPPER_MARK, 0.9)
-      * this.conf.getLong(HConstants.HREGION_MAX_FILESIZE, HConstants.DEFAULT_MAX_FILE_SIZE);
+        * this.conf.getLong(HConstants.HREGION_MAX_FILESIZE, HConstants.DEFAULT_MAX_FILE_SIZE);
     sleepBetweenCycles = this.conf.getInt(SLEEP, 2000);
     this.maxRoundsStuck = this.conf.getInt(MAX_ROUNDS_IDLE, 10);
+    this.maxMergesPerRound = this.conf.getInt(MAX_MERGES_PER_ROUND, 30);
+    this.minRegionAgeDays = this.conf.getInt(MIN_REGION_AGE_DAYS, 7);
+    this.mergeTimeoutSecs = this.conf.getInt(MERGE_TIMEOUT_SECS, 60);
+
+    this.executor = Executors.newFixedThreadPool(this.maxMergesPerRound);
   }
 
   private Path getTablePath(TableName table) {
@@ -111,9 +131,9 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
     Table metaTbl = connection.getTable(META_TABLE_NAME);
     String tblName = table.getNameAsString();
     RowFilter rowFilter =
-      new RowFilter(CompareOperator.EQUAL, new SubstringComparator(tblName + ","));
+        new RowFilter(CompareOperator.EQUAL, new SubstringComparator(tblName + ","));
     SingleColumnValueFilter colFilter = new SingleColumnValueFilter(CATALOG_FAMILY, STATE_QUALIFIER,
-      CompareOperator.EQUAL, Bytes.toBytes("OPEN"));
+        CompareOperator.EQUAL, Bytes.toBytes("OPEN"));
     colFilter.setFilterIfMissing(true);
     Scan scan = new Scan();
     FilterList filter = new FilterList(FilterList.Operator.MUST_PASS_ALL);
@@ -131,12 +151,12 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
   }
 
   private boolean canMerge(Path path, RegionInfo region1, RegionInfo region2,
-    Collection<Pair<RegionInfo, RegionInfo>> alreadyMerging) throws IOException {
+                           Collection<Pair<RegionInfo, RegionInfo>> alreadyMerging) throws IOException {
     if (
-      alreadyMerging.stream()
-        .anyMatch(regionPair -> region1.equals(regionPair.getFirst())
-          || region2.equals(regionPair.getFirst()) || region1.equals(regionPair.getSecond())
-          || region2.equals(regionPair.getSecond()))
+        alreadyMerging.stream()
+            .anyMatch(regionPair -> region1.equals(regionPair.getFirst())
+                || region2.equals(regionPair.getFirst()) || region1.equals(regionPair.getSecond())
+                || region2.equals(regionPair.getSecond()))
     ) {
       return false;
     }
@@ -146,15 +166,16 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
       boolean mergeable = (resultSizeThreshold > (size1 + size2));
       if (!mergeable) {
         LOG.warn(
-          "Not merging regions {} and {} because resulting region size would get close to "
-            + "the {} limit. {} total size: {}; {} total size:{}",
-          region1.getEncodedName(), region2.getEncodedName(), resultSizeThreshold,
-          region1.getEncodedName(), size1, region2.getEncodedName(), size2);
+            "Not merging regions {} and {} because resulting region size would get too close to "
+                + "the {} GB limit. {} total size: {} GB; {} total size:{} GB",
+            region1.getEncodedName(), region2.getEncodedName(), resultSizeThreshold / GIGABYTE,
+            region1.getEncodedName(), size1 / GIGABYTE,
+            region2.getEncodedName(), size2 / GIGABYTE);
       }
       return mergeable;
     } else {
       LOG.warn("WARNING: Can't merge regions {} and {} because those are not adjacent.",
-        region1.getEncodedName(), region2.getEncodedName());
+          region1.getEncodedName(), region2.getEncodedName());
       return false;
     }
   }
@@ -166,86 +187,180 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
     Result r = meta.get(get);
     boolean result = HBCKMetaTableAccessor.getMergeRegions(r.rawCells()) != null;
     if (result) {
-      LOG.warn("Region {} has an existing merge qualifier and can't be merged until for now. \n "
-        + "RegionsMerger will skip this region until merge qualifier is cleaned away. \n "
-        + "Consider major compact this region.", region.getEncodedName());
+      LOG.warn("Region {} has an existing merge qualifier and can't be merged for now. \n "
+          + "RegionsMerger will skip this region until the merge qualifier is cleaned away. \n "
+          + "Consider major compact this region.", region.getEncodedName());
     }
     return result;
   }
 
+  private Future<Void> requestMergeRegions(Admin admin, RegionInfo current,
+                                           RegionInfo previous,
+                                           Map<Future<Void>, Pair<RegionInfo, RegionInfo>> regionsMerging) {
+    return executor.submit(() -> {
+      Future<Void> f = admin.mergeRegionsAsync(current.getEncodedNameAsBytes(),
+          previous.getEncodedNameAsBytes(), false);
+
+      Pair<RegionInfo, RegionInfo> regionPair = new Pair<>(previous, current);
+      regionsMerging.put(f, regionPair);
+      return null;
+    });
+  }
+
   public void mergeRegions(String tblName, int targetRegions) throws Exception {
+    LOG.info("Table name               : {}", tblName);
+    LOG.info("Target number of regions : {}", targetRegions);
+    LOG.info("Max region size threshold: {} GB", resultSizeThreshold / GIGABYTE);
+    LOG.info("Sleep between cycles     : {} ms", sleepBetweenCycles);
+    LOG.info("Max rounds stuck         : {}", maxRoundsStuck);
+    LOG.info("Max merges per round     : {}", maxMergesPerRound);
+    LOG.info("Min region age           : {} d", minRegionAgeDays);
+
+    Random rand = new Random();
+    long minRegionAgeMilliseconds = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(minRegionAgeDays);
+
     TableName table = TableName.valueOf(tblName);
     Path tableDir = getTablePath(table);
     try (Connection conn = ConnectionFactory.createConnection(conf)) {
       Admin admin = conn.getAdmin();
-      LongAdder counter = new LongAdder();
-      LongAdder lastTimeProgessed = new LongAdder();
-      // need to get all regions for the table, regardless of region state
-      List<RegionInfo> regions = admin.getRegions(table);
-      Map<Future, Pair<RegionInfo, RegionInfo>> regionsMerging = new ConcurrentHashMap<>();
+
+      long totalIterations = 0;
+      long mergeAttemptsThisRound, mergeSubmitsFailedThisRound;
+      LongAdder failureCount = new LongAdder();
+      LongAdder successCount = new LongAdder();
+      long lastSuccessCount = 0;
       long roundsNoProgress = 0;
-      while (regions.size() > targetRegions) {
-        LOG.info("Iteration: {}", counter);
-        RegionInfo previous = null;
-        int regionSize = regions.size();
-        LOG.info("Attempting to merge {} regions to reach the target {} ...", regionSize,
-          targetRegions);
+      long regionsCount = 0;
+
+      // need to get all regions for the table, regardless of region state
+      regionsCount = admin.getRegions(table).size();
+      List<RegionInfo> regionsOpen;
+
+      List<Future<Void>> mergeSubmitsThisRoundFutures = new ArrayList<>(maxMergesPerRound);
+      Map<Future<Void>, Pair<RegionInfo, RegionInfo>> regionsMerging = new ConcurrentHashMap<>();
+
+      int startRegionIndex, currentRegionIndex;
+      RegionInfo current, previous;
+      boolean currentHasMergeRef, previousHasMergeRef;
+
+      while (regionsCount > targetRegions) {
+        LOG.info("Iteration                : {}", totalIterations);
+        previous = null;
+        currentHasMergeRef = true;
+        previousHasMergeRef = true;
+        mergeAttemptsThisRound = 0;
+        mergeSubmitsFailedThisRound = 0;
+
         // to request merge, regions must be OPEN, though
-        regions = getOpenRegions(conn, table);
-        for (RegionInfo current : regions) {
-          if (!current.isSplit()) {
+        regionsOpen = getOpenRegions(conn, table);
+        LOG.info("Current number of regions: {} (open: {})", regionsCount, regionsOpen.size());
+        LOG.info("Target number of regions : {}", targetRegions);
+        startRegionIndex = rand.nextInt(regionsOpen.size());
+        LOG.info("Starting from index      : {}", startRegionIndex);
+        for (int i = 0; i < regionsOpen.size(); i++) {
+          currentRegionIndex = (startRegionIndex + i) % regionsOpen.size();
+          current = regionsOpen.get(currentRegionIndex);
+
+          /*
+           * RegionInfo.getRegionId() returns the region's creation timestamp
+           * in milliseconds (set at region creation time).
+           * This is the standard way to determine region "age" in HBase.
+           */
+          long regionId = current.getRegionId();
+
+          if (!current.isSplit() && regionId < minRegionAgeMilliseconds) {
+            currentHasMergeRef = hasPreviousMergeRef(conn, current);
             if (
-              previous != null && canMerge(tableDir, previous, current, regionsMerging.values())
+                previous != null && canMerge(tableDir, previous, current, regionsMerging.values())
             ) {
               // Before submitting a merge request, we need to check if any of the region candidates
               // still have merge references from previous cycle
-              boolean hasMergeRef =
-                hasPreviousMergeRef(conn, previous) || hasPreviousMergeRef(conn, current);
+              boolean hasMergeRef = previousHasMergeRef || currentHasMergeRef;
               if (!hasMergeRef) {
-                Future f = admin.mergeRegionsAsync(current.getEncodedNameAsBytes(),
-                  previous.getEncodedNameAsBytes(), true);
-                Pair<RegionInfo, RegionInfo> regionPair = new Pair<>(previous, current);
-                regionsMerging.put(f, regionPair);
-                if ((regionSize - regionsMerging.size()) <= targetRegions) {
+                mergeSubmitsThisRoundFutures.add(requestMergeRegions(admin, current, previous, regionsMerging));
+                mergeAttemptsThisRound++;
+
+                LOG.info("({}/{}) Requested the merging of regions {} and {} together.",
+                    mergeAttemptsThisRound,
+                    maxMergesPerRound,
+                    current.getEncodedName(),
+                    previous.getEncodedName());
+
+                if (mergeAttemptsThisRound >= maxMergesPerRound) {
+                  LOG.info("The target number of merges this round has been reached: Stopping merging.");
                   break;
                 }
+                if (regionsCount - mergeAttemptsThisRound <= targetRegions) {
+                  LOG.info("The target number of region may have been reached: Stopping merging.");
+                  break;
+                }
+
+                previous = null;
               } else {
                 LOG.info("Skipping merge of candidates {} and {} because of existing merge "
-                  + "qualifiers.", previous.getEncodedName(), current.getEncodedName());
+                    + "qualifiers.", previous.getEncodedName(), current.getEncodedName());
+
+                previous = (!currentHasMergeRef) ? current : null;
+                previousHasMergeRef = currentHasMergeRef;
               }
-              previous = null;
             } else {
-              previous = current;
+              previous = (!currentHasMergeRef) ? current : null;
+              previousHasMergeRef = currentHasMergeRef;
             }
           } else {
             LOG.debug("Skipping split region: {}", current.getEncodedName());
           }
         }
-        counter.increment();
-        LOG.info("Sleeping for {} seconds before next iteration...", (sleepBetweenCycles / 1000));
-        Thread.sleep(sleepBetweenCycles);
-        regionsMerging.forEach((f, currentPair) -> {
-          if (f.isDone()) {
-            LOG.info("Merged regions {} and {} together.", currentPair.getFirst().getEncodedName(),
-              currentPair.getSecond().getEncodedName());
-            regionsMerging.remove(f);
-            lastTimeProgessed.reset();
-            lastTimeProgessed.add(counter.longValue());
-          } else {
-            LOG.warn("Merge of regions {} and {} isn't completed yet.", currentPair.getFirst(),
-              currentPair.getSecond());
+
+        LOG.info("Waiting for all the merging requests to be processed...");
+        for (Future<Void> f : mergeSubmitsThisRoundFutures) {
+          try {
+            f.get(mergeTimeoutSecs, TimeUnit.SECONDS);
+          } catch (InterruptedException | TimeoutException | ExecutionException e) {
+            // Failed submitting merging request. Ignoring this request.
+            mergeSubmitsFailedThisRound++;
           }
-        });
-        roundsNoProgress = counter.longValue() - lastTimeProgessed.longValue();
-        if (roundsNoProgress == this.maxRoundsStuck) {
-          LOG.warn("Reached {} iterations without progressing with new merges. Aborting...",
-            roundsNoProgress);
-          break;
         }
 
-        // again, get all regions, regardless of the state,
-        // in order to avoid breaking the loop prematurely
-        regions = admin.getRegions(table);
+        mergeSubmitsThisRoundFutures.clear();
+        LOG.info("All requests were submitted ({} failed)", mergeSubmitsFailedThisRound);
+
+        regionsMerging.forEach((f, currentPair) -> {
+          LOG.info("Waiting for {} and {} to be merged.", currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName());
+          try {
+            f.get(mergeTimeoutSecs, TimeUnit.SECONDS);
+            successCount.increment();
+          } catch (InterruptedException | TimeoutException | ExecutionException e) {
+            LOG.error("Merging regions failed:", e);
+            failureCount.increment();
+          }
+        });
+
+        regionsMerging.clear();
+        LOG.info("All requests completed: Success={} Failures={}",
+            successCount.longValue(), failureCount.longValue());
+
+        totalIterations++;
+
+        if (successCount.longValue() == lastSuccessCount) {
+          roundsNoProgress++;
+          LOG.warn("No progress this round ({}/{})...", roundsNoProgress, this.maxMergesPerRound);
+          if (roundsNoProgress >= this.maxRoundsStuck) {
+            LOG.warn("Reached {} iterations without progressing with new merges. Aborting...",
+                roundsNoProgress);
+            return;
+          }
+        } else {
+          lastSuccessCount = successCount.longValue();
+          roundsNoProgress = 0;
+        }
+
+        regionsCount = admin.getRegions(table).size();
+        if (regionsCount > targetRegions) {
+          LOG.info("Sleeping for {} seconds before starting the next iteration...",
+              (sleepBetweenCycles / 1000));
+          Thread.sleep(sleepBetweenCycles);
+        }
       }
     }
   }
@@ -254,16 +369,19 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
   public int run(String[] args) {
     if (args.length != 2) {
       LOG.error(
-        "Wrong number of arguments. " + "Arguments are: <TABLE_NAME> <TARGET_NUMBER_OF_REGIONS>");
+          "Wrong number of arguments. " + "Arguments are: <TABLE_NAME> <TARGET_NUMBER_OF_REGIONS>");
       return 1;
     }
+    int returnCode = 0;
     try {
       this.mergeRegions(args[0], Integer.parseInt(args[1]));
     } catch (Exception e) {
       LOG.error("Merging regions failed:", e);
-      return 2;
+      returnCode = 2;
+    } finally {
+      executor.shutdown();
     }
-    return 0;
+    return returnCode;
   }
 
   public static void main(String[] args) throws Exception {
