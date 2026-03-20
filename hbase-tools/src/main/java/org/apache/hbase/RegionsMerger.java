@@ -325,20 +325,37 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
         mergeSubmitsThisRoundFutures.clear();
         LOG.info("All requests were submitted ({} failed)", mergeSubmitsFailedThisRound);
 
+        // Track merges that are still in progress (e.g., timed out but not failed) so we can
+        // re-check them in subsequent rounds instead of dropping tracking entirely.
+        Map<Future<Void>, Pair<RegionInfo, RegionInfo>> stillMerging = new ConcurrentHashMap<>();
         regionsMerging.forEach((f, currentPair) -> {
-          LOG.info("Waiting for {} and {} to be merged.", currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName());
+          LOG.info("Waiting for {} and {} to be merged.",
+              currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName());
           try {
             f.get(mergeTimeoutSecs, TimeUnit.SECONDS);
             successCount.increment();
-          } catch (InterruptedException | TimeoutException | ExecutionException e) {
-            LOG.error("Merging regions failed:", e);
+          } catch (TimeoutException te) {
+            // The merge may still be running on the server; keep tracking it for the next round.
+            LOG.warn("Timed out waiting for merge of {} and {} to complete; will re-check later.",
+                currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName());
+            stillMerging.put(f, currentPair);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            LOG.error("Interrupted while waiting for merge of {} and {}.",
+                currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName(), ie);
+            failureCount.increment();
+          } catch (ExecutionException ee) {
+            LOG.error("Merging regions {} and {} failed:",
+                currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName(), ee);
             failureCount.increment();
           }
         });
 
+        // Replace the old map with only those merges that are still in progress.
         regionsMerging.clear();
-        LOG.info("All requests completed: Success={} Failures={}",
-            successCount.longValue(), failureCount.longValue());
+        regionsMerging.putAll(stillMerging);
+        LOG.info("All requests completed (this round): Success={} Failures={} StillInProgress={}",
+            successCount.longValue(), failureCount.longValue(), regionsMerging.size());
 
         totalIterations++;
 
