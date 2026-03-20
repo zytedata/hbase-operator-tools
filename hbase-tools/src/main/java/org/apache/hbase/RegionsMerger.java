@@ -268,6 +268,16 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
         regionsOpen = getOpenRegions(conn, table);
         LOG.info("Current number of regions: {} (open: {})", regionsCount, regionsOpen.size());
         LOG.info("Target number of regions : {}", targetRegions);
+        if (regionsOpen.isEmpty()) {
+          LOG.warn("No OPEN regions found for table {}. Sleeping before retrying.", table);
+          try {
+            TimeUnit.SECONDS.sleep(5);
+          } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+            break;
+          }
+          continue;
+        }
         startRegionIndex = rand.nextInt(regionsOpen.size());
         LOG.info("Starting from index      : {}", startRegionIndex);
         for (int i = 0; i < regionsOpen.size(); i++) {
