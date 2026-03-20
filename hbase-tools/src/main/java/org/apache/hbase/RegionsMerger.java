@@ -384,7 +384,7 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
 
         if (successCount.longValue() == lastSuccessCount) {
           roundsNoProgress++;
-          LOG.warn("No progress this round ({}/{})...", roundsNoProgress, this.maxMergesPerRound);
+          LOG.warn("No progress this round ({}/{})...", roundsNoProgress, this.maxRoundsStuck);
           if (roundsNoProgress >= this.maxRoundsStuck) {
             LOG.warn("Reached {} iterations without progressing with new merges. Aborting...",
                 roundsNoProgress);
