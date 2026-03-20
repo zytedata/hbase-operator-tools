@@ -315,7 +315,7 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
                   break;
                 }
                 if (regionsCount - mergeAttemptsThisRound <= targetRegions) {
-                  LOG.info("The target number of region may have been reached: Stopping merging.");
+                  LOG.info("The target number of regions may have been reached: Stopping merging.");
                   break;
                 }
 
