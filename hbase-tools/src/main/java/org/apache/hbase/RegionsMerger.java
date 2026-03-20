@@ -194,17 +194,18 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
   }
 
   private boolean hasPreviousMergeRef(Connection conn, RegionInfo region) throws Exception {
-    Table meta = conn.getTable(TableName.META_TABLE_NAME);
-    Get get = new Get(region.getRegionName());
-    get.addFamily(HConstants.CATALOG_FAMILY);
-    Result r = meta.get(get);
-    boolean result = HBCKMetaTableAccessor.getMergeRegions(r.rawCells()) != null;
-    if (result) {
-      LOG.warn("Region {} has an existing merge qualifier and can't be merged for now. \n "
-          + "RegionsMerger will skip this region until the merge qualifier is cleaned away. \n "
-          + "Consider major compact this region.", region.getEncodedName());
+    try (Table meta = conn.getTable(TableName.META_TABLE_NAME)) {
+      Get get = new Get(region.getRegionName());
+      get.addFamily(HConstants.CATALOG_FAMILY);
+      Result r = meta.get(get);
+      boolean result = HBCKMetaTableAccessor.getMergeRegions(r.rawCells()) != null;
+      if (result) {
+        LOG.warn("Region {} has an existing merge qualifier and can't be merged for now. \n "
+            + "RegionsMerger will skip this region until the merge qualifier is cleaned away. \n "
+            + "Consider major compact this region.", region.getEncodedName());
+      }
+      return result;
     }
-    return result;
   }
 
   private Future<Void> requestMergeRegions(Admin admin, RegionInfo current,
