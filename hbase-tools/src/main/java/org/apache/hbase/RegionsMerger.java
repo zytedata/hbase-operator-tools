@@ -69,7 +69,7 @@ import org.slf4j.LoggerFactory;
  * for the table is reached, or no more merges can complete due to limit in resulting merged region
  * size.
  */
-public class RegionsMerger extends Configured implements org.apache.hadoop.util.Tool {
+public class RegionsMerger extends Configured implements org.apache.hadoop.util.Tool, AutoCloseable {
   private static final long GIGABYTE = 1024*1024*1024;
 
   private static final Logger LOG = LoggerFactory.getLogger(RegionsMerger.class.getName());
@@ -104,6 +104,19 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
     this.mergeTimeoutSecs = this.conf.getInt(MERGE_TIMEOUT_SECS, 60);
 
     this.executor = Executors.newFixedThreadPool(this.maxMergesPerRound);
+  }
+
+  @Override
+  public void close() {
+    executor.shutdown();
+    try {
+      if (!executor.awaitTermination(mergeTimeoutSecs, TimeUnit.SECONDS)) {
+        executor.shutdownNow();
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      executor.shutdownNow();
+    }
   }
 
   private Path getTablePath(TableName table) {
