@@ -69,7 +69,7 @@ import org.slf4j.LoggerFactory;
  * for the table is reached, or no more merges can complete due to limit in resulting merged region
  * size.
  */
-public class RegionsMerger extends Configured implements org.apache.hadoop.util.Tool, AutoCloseable {
+public class RegionsMerger extends Configured implements org.apache.hadoop.util.Tool {
   private static final long GIGABYTE = 1024*1024*1024;
 
   private static final Logger LOG = LoggerFactory.getLogger(RegionsMerger.class.getName());
@@ -89,8 +89,6 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
   private final int minRegionAgeDays;
   private final int mergeTimeoutSecs;
 
-  private final ExecutorService executor;
-
   public RegionsMerger(Configuration conf) throws IOException {
     this.conf = conf;
     Path basePath = new Path(conf.get(HConstants.HBASE_DIR));
@@ -102,21 +100,6 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
     this.maxMergesPerRound = this.conf.getInt(MAX_MERGES_PER_ROUND, 30);
     this.minRegionAgeDays = this.conf.getInt(MIN_REGION_AGE_DAYS, 7);
     this.mergeTimeoutSecs = this.conf.getInt(MERGE_TIMEOUT_SECS, 60);
-
-    this.executor = Executors.newFixedThreadPool(this.maxMergesPerRound);
-  }
-
-  @Override
-  public void close() {
-    executor.shutdown();
-    try {
-      if (!executor.awaitTermination(mergeTimeoutSecs, TimeUnit.SECONDS)) {
-        executor.shutdownNow();
-      }
-    } catch (InterruptedException e) {
-      Thread.currentThread().interrupt();
-      executor.shutdownNow();
-    }
   }
 
   private Path getTablePath(TableName table) {
@@ -208,7 +191,7 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
     }
   }
 
-  private Future<Void> requestMergeRegions(Admin admin, RegionInfo current,
+  private Future<Void> requestMergeRegions(ExecutorService executor, Admin admin, RegionInfo current,
                                            RegionInfo previous,
                                            Map<Future<Void>, Pair<RegionInfo, RegionInfo>> regionsMerging) {
     return executor.submit(() -> {
@@ -221,15 +204,7 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
     });
   }
 
-  public void mergeRegions(String tblName, int targetRegions) throws Exception {
-    LOG.info("Table name               : {}", tblName);
-    LOG.info("Target number of regions : {}", targetRegions);
-    LOG.info("Max region size threshold: {} GB", resultSizeThreshold / GIGABYTE);
-    LOG.info("Sleep between cycles     : {} ms", sleepBetweenCycles);
-    LOG.info("Max rounds stuck         : {}", maxRoundsStuck);
-    LOG.info("Max merges per round     : {}", maxMergesPerRound);
-    LOG.info("Min region age           : {} d", minRegionAgeDays);
-
+  private void mergingLoop(String tblName, int targetRegions, ExecutorService executor) throws Exception {
     Random rand = new Random();
     long minRegionAgeMilliseconds = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(minRegionAgeDays);
 
@@ -252,36 +227,54 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
 
       List<Future<Void>> mergeSubmitsThisRoundFutures = new ArrayList<>(maxMergesPerRound);
       Map<Future<Void>, Pair<RegionInfo, RegionInfo>> regionsMerging = new ConcurrentHashMap<>();
+      Map<Future<Void>, Pair<RegionInfo, RegionInfo>> stillMerging = new ConcurrentHashMap<>();
 
       int startRegionIndex, currentRegionIndex;
       RegionInfo current, previous;
       boolean currentHasMergeRef, previousHasMergeRef;
+      mergeAttemptsThisRound = 0;
 
       while (regionsCount > targetRegions) {
         LOG.info("Iteration                : {}", totalIterations);
         previous = null;
         currentHasMergeRef = true;
         previousHasMergeRef = true;
-        mergeAttemptsThisRound = 0;
         mergeSubmitsFailedThisRound = 0;
 
         // to request merge, regions must be OPEN, though
         regionsOpen = getOpenRegions(conn, table);
         LOG.info("Current number of regions: {} (open: {})", regionsCount, regionsOpen.size());
-        LOG.info("Target number of regions : {}", targetRegions);
         if (regionsOpen.isEmpty()) {
-          LOG.warn("No OPEN regions found for table {}. Sleeping before retrying.", table);
-          try {
-            TimeUnit.SECONDS.sleep(5);
-          } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-            break;
-          }
-          continue;
+          LOG.warn("No OPEN regions found for table {}.", table);
+          roundsNoProgress++;
+          LOG.warn("No progress this round ({}/{})...", roundsNoProgress, this.maxRoundsStuck);
+          if (roundsNoProgress >= this.maxRoundsStuck) {
+            LOG.warn("Reached {} iterations without progressing with new merges. Aborting...",
+                roundsNoProgress);
+            return;
+          } else {
+            LOG.info("Sleeping for {} seconds before starting the next iteration...",
+              (sleepBetweenCycles / 1000));
+            try {
+              Thread.sleep(sleepBetweenCycles);
+            } catch (InterruptedException ie) {
+              Thread.currentThread().interrupt();
+              break;
+            }
+            continue;
+            }
         }
         startRegionIndex = rand.nextInt(regionsOpen.size());
         LOG.info("Starting from index      : {}", startRegionIndex);
         for (int i = 0; i < regionsOpen.size(); i++) {
+          if (mergeAttemptsThisRound >= maxMergesPerRound) {
+            LOG.info("The target number of merges this round has been reached: Stopping merging.");
+            break;
+          }
+          if (regionsCount - mergeAttemptsThisRound <= targetRegions) {
+            LOG.info("The target number of regions may have been reached: Stopping merging.");
+            break;
+          }
           currentRegionIndex = (startRegionIndex + i) % regionsOpen.size();
           current = regionsOpen.get(currentRegionIndex);
 
@@ -301,7 +294,7 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
               // still have merge references from previous cycle
               boolean hasMergeRef = previousHasMergeRef || currentHasMergeRef;
               if (!hasMergeRef) {
-                mergeSubmitsThisRoundFutures.add(requestMergeRegions(admin, current, previous, regionsMerging));
+                mergeSubmitsThisRoundFutures.add(requestMergeRegions(executor, admin, current, previous, regionsMerging));
                 mergeAttemptsThisRound++;
 
                 LOG.info("({}/{}) Requested the merging of regions {} and {} together.",
@@ -309,15 +302,6 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
                     maxMergesPerRound,
                     current.getEncodedName(),
                     previous.getEncodedName());
-
-                if (mergeAttemptsThisRound >= maxMergesPerRound) {
-                  LOG.info("The target number of merges this round has been reached: Stopping merging.");
-                  break;
-                }
-                if (regionsCount - mergeAttemptsThisRound <= targetRegions) {
-                  LOG.info("The target number of regions may have been reached: Stopping merging.");
-                  break;
-                }
 
                 previous = null;
               } else {
@@ -354,9 +338,6 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
         mergeSubmitsThisRoundFutures.clear();
         LOG.info("All requests were submitted ({} failed)", mergeSubmitsFailedThisRound);
 
-        // Track merges that are still in progress (e.g., timed out but not failed) so we can
-        // re-check them in subsequent rounds instead of dropping tracking entirely.
-        Map<Future<Void>, Pair<RegionInfo, RegionInfo>> stillMerging = new ConcurrentHashMap<>();
         regionsMerging.forEach((f, currentPair) -> {
           LOG.info("Waiting for {} and {} to be merged.",
               currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName());
@@ -367,6 +348,8 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
             // The merge may still be running on the server; keep tracking it for the next round.
             LOG.warn("Timed out waiting for merge of {} and {} to complete; will re-check later.",
                 currentPair.getFirst().getEncodedName(), currentPair.getSecond().getEncodedName());
+            // Track merges that are still in progress (e.g., timed out but not failed) so we can
+            // re-check them in subsequent rounds instead of dropping tracking entirely.
             stillMerging.put(f, currentPair);
           } catch (InterruptedException ie) {
             Thread.currentThread().interrupt();
@@ -380,12 +363,14 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
           }
         });
 
-        // Replace the old map with only those merges that are still in progress.
-        regionsMerging.clear();
-        regionsMerging.putAll(stillMerging);
         LOG.info("All requests completed (this round): Success={} Failures={} StillInProgress={}",
             successCount.longValue(), failureCount.longValue(), regionsMerging.size());
 
+        // Replace the old map with only those merges that are still in progress.
+        regionsMerging.clear();
+        regionsMerging.putAll(stillMerging);
+        mergeAttemptsThisRound = stillMerging.size();
+        stillMerging.clear();
         totalIterations++;
 
         if (successCount.longValue() == lastSuccessCount) {
@@ -411,6 +396,32 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
     }
   }
 
+  public void mergeRegions(String tblName, int targetRegions) throws Exception {
+    LOG.info("Table name               : {}", tblName);
+    LOG.info("Target number of regions : {}", targetRegions);
+    LOG.info("Max region size threshold: {} GB", resultSizeThreshold / GIGABYTE);
+    LOG.info("Sleep between cycles     : {} ms", sleepBetweenCycles);
+    LOG.info("Max rounds stuck         : {}", maxRoundsStuck);
+    LOG.info("Max merges per round     : {}", maxMergesPerRound);
+    LOG.info("Min region age           : {} d", minRegionAgeDays);
+
+    ExecutorService executor = Executors.newFixedThreadPool(this.maxMergesPerRound);
+    try {
+      mergingLoop(tblName, targetRegions, executor);
+      executor.shutdown();
+      if (!executor.awaitTermination(mergeTimeoutSecs, TimeUnit.SECONDS)) {
+        executor.shutdownNow();
+      }
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      executor.shutdownNow();
+      throw e;
+    } catch (Exception e) {
+      executor.shutdownNow();
+      throw e;
+    }
+  }
+
   @Override
   public int run(String[] args) {
     if (args.length != 2) {
@@ -424,8 +435,6 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
     } catch (Exception e) {
       LOG.error("Merging regions failed:", e);
       returnCode = 2;
-    } finally {
-      executor.shutdown();
     }
     return returnCode;
   }
