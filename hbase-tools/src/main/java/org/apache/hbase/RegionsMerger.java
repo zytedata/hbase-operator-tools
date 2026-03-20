@@ -340,7 +340,12 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
         for (Future<Void> f : mergeSubmitsThisRoundFutures) {
           try {
             f.get(mergeTimeoutSecs, TimeUnit.SECONDS);
-          } catch (InterruptedException | TimeoutException | ExecutionException e) {
+          } catch (InterruptedException ie) {
+            // Restore interrupt status and stop waiting on further merge submissions.
+            Thread.currentThread().interrupt();
+            mergeSubmitsFailedThisRound++;
+            break;
+          } catch (TimeoutException | ExecutionException e) {
             // Failed submitting merging request. Ignoring this request.
             mergeSubmitsFailedThisRound++;
           }
