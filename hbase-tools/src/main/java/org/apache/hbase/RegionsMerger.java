@@ -141,7 +141,6 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
 
   private List<RegionInfo> getOpenRegions(Connection connection, TableName table) throws Exception {
     List<RegionInfo> regions = new ArrayList<>();
-    Table metaTbl = connection.getTable(META_TABLE_NAME);
     String tblName = table.getNameAsString();
     RowFilter rowFilter =
         new RowFilter(CompareOperator.EQUAL, new SubstringComparator(tblName + ","));
@@ -153,7 +152,8 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
     filter.addFilter(rowFilter);
     filter.addFilter(colFilter);
     scan.setFilter(filter);
-    try (ResultScanner rs = metaTbl.getScanner(scan)) {
+    try (Table metaTbl = connection.getTable(META_TABLE_NAME);
+         ResultScanner rs = metaTbl.getScanner(scan)) {
       Result r;
       while ((r = rs.next()) != null) {
         RegionInfo region = RegionInfo.parseFrom(r.getValue(CATALOG_FAMILY, REGIONINFO_QUALIFIER));
