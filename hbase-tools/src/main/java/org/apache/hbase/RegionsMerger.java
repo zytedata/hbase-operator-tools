@@ -210,8 +210,8 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
 
     TableName table = TableName.valueOf(tblName);
     Path tableDir = getTablePath(table);
-    try (Connection conn = ConnectionFactory.createConnection(conf)) {
-      Admin admin = conn.getAdmin();
+    try (Connection conn = ConnectionFactory.createConnection(conf);
+         Admin admin = conn.getAdmin()) {
 
       long totalIterations = 0;
       long mergeAttemptsThisRound, mergeSubmitsFailedThisRound;
