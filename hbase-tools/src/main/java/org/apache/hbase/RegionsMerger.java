@@ -206,13 +206,13 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
 
   private void mergingLoop(String tblName, int targetRegions, ExecutorService executor) throws Exception {
     Random rand = new Random();
-    long minRegionAgeMilliseconds = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(minRegionAgeDays);
 
     TableName table = TableName.valueOf(tblName);
     Path tableDir = getTablePath(table);
     try (Connection conn = ConnectionFactory.createConnection(conf);
          Admin admin = conn.getAdmin()) {
 
+      long minRegionAgeMilliseconds;
       long totalIterations = 0;
       long mergeAttemptsThisRound, mergeSubmitsFailedThisRound;
       LongAdder failureCount = new LongAdder();
@@ -236,6 +236,7 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
 
       while (regionsCount > targetRegions) {
         LOG.info("Iteration                : {}", totalIterations);
+        minRegionAgeMilliseconds = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(minRegionAgeDays);
         previous = null;
         currentHasMergeRef = true;
         previousHasMergeRef = true;
