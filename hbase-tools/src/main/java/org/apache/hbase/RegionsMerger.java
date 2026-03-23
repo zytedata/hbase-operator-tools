@@ -286,7 +286,7 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
            */
           long regionId = current.getRegionId();
 
-          if (!current.isSplit() && regionId < minRegionAgeMilliseconds) {
+          if (!current.isSplit() && regionId <= minRegionAgeMilliseconds) {
             currentHasMergeRef = hasPreviousMergeRef(conn, current);
             if (
                 previous != null && canMerge(tableDir, previous, current, regionsMerging.values())
@@ -303,12 +303,10 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
                     maxMergesPerRound,
                     current.getEncodedName(),
                     previous.getEncodedName());
-
                 previous = null;
               } else {
                 LOG.info("Skipping merge of candidates {} and {} because of existing merge "
                     + "qualifiers.", previous.getEncodedName(), current.getEncodedName());
-
                 previous = (!currentHasMergeRef) ? current : null;
                 previousHasMergeRef = currentHasMergeRef;
               }
@@ -317,7 +315,11 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
               previousHasMergeRef = currentHasMergeRef;
             }
           } else {
-            LOG.debug("Skipping split region: {}", current.getEncodedName());
+            if (regionId > minRegionAgeMilliseconds) {
+              LOG.info("Skipping split region because it's too young: {}", current.getEncodedName());
+            } else {
+              LOG.info("Skipping split region because region has been split: {}", current.getEncodedName());
+            }
           }
         }
 
@@ -365,7 +367,7 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
         });
 
         LOG.info("All requests completed so far: TotalSuccesses={} TotalFailures={} StillInProgress={}",
-            successCount.longValue(), failureCount.longValue(), regionsMerging.size());
+            successCount.longValue(), failureCount.longValue(), stillMerging.size());
 
         // Replace the old map with only those merges that are still in progress.
         regionsMerging.clear();
@@ -394,6 +396,8 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
           Thread.sleep(sleepBetweenCycles);
         }
       }
+
+      LOG.info("Target regions has been met. Finishing...");
     }
   }
 
