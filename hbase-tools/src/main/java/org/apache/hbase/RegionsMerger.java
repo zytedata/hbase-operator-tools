@@ -363,7 +363,7 @@ public class RegionsMerger extends Configured implements org.apache.hadoop.util.
           }
         });
 
-        LOG.info("All requests completed (this round): Success={} Failures={} StillInProgress={}",
+        LOG.info("All requests completed so far: TotalSuccesses={} TotalFailures={} StillInProgress={}",
             successCount.longValue(), failureCount.longValue(), regionsMerging.size());
 
         // Replace the old map with only those merges that are still in progress.
