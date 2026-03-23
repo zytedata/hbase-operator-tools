@@ -70,7 +70,7 @@ import org.slf4j.LoggerFactory;
  * size.
  */
 public class RegionsMerger extends Configured implements org.apache.hadoop.util.Tool {
-  private static final long GIGABYTE = 1024*1024*1024;
+  private static final long GIGABYTE = 1024L * 1024 * 1024;
 
   private static final Logger LOG = LoggerFactory.getLogger(RegionsMerger.class.getName());
   public static final String RESULTING_REGION_UPPER_MARK = "hbase.tools.merge.upper.mark";
