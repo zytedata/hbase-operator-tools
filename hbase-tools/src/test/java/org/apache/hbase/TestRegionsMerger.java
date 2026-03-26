@@ -75,7 +75,8 @@ public class TestRegionsMerger {
   @Test
   public void testMergeRegionsCanMergeToTarget() throws Exception {
     final int originalCount = TEST_UTIL.countRows(table);
-    TEST_UTIL.getConfiguration().setInt(RegionsMerger.MAX_ROUNDS_IDLE, 10);
+    TEST_UTIL.getConfiguration().setInt(RegionsMerger.MIN_REGION_AGE_DAYS, 0);
+    TEST_UTIL.getConfiguration().setInt(RegionsMerger.MAX_ROUNDS_IDLE, 11);
     // hbase-2.3 and hbase-2.1 merge's work differently; 2.3 won't merge if a merge candidate
     // is a parent.
     // The below used to merge until only 3 regions. Made it less aggressive. Originally there
@@ -92,6 +93,7 @@ public class TestRegionsMerger {
   public void testMergeRegionsForNonDefaultNamespaceTable() throws Exception {
     try {
       TEST_UTIL.getConfiguration().setInt(RegionsMerger.MAX_ROUNDS_IDLE, 10);
+      TEST_UTIL.getConfiguration().setInt(RegionsMerger.MIN_REGION_AGE_DAYS, 0);
       TEST_UTIL.getAdmin().createNamespace(NamespaceDescriptor.create(NAMESPACE).build());
       Table tableWithNamespace =
         TEST_UTIL.createMultiRegionTable(TABLE_NAME_WITH_NAMESPACE, family, 15);
@@ -109,6 +111,7 @@ public class TestRegionsMerger {
 
   @Test
   public void testMergeRegionsCanMergeSomeButNotToTarget() throws Exception {
+    TEST_UTIL.getConfiguration().setInt(RegionsMerger.MIN_REGION_AGE_DAYS, 0);
     TEST_UTIL.getConfiguration().setInt(RegionsMerger.MAX_ROUNDS_IDLE, 3);
     generateTableData();
     final int originalCount = TEST_UTIL.countRows(table);
@@ -142,6 +145,7 @@ public class TestRegionsMerger {
 
   @Test
   public void testRegionHasNoState() throws Exception {
+    TEST_UTIL.getConfiguration().setInt(RegionsMerger.MIN_REGION_AGE_DAYS, 0);
     TEST_UTIL.getConfiguration().setInt(RegionsMerger.MAX_ROUNDS_IDLE, 3);
     generateTableData();
     // Turn on the replication of the table, and then merge two regions, the parent regions will
